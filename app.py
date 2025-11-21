@@ -1,17 +1,17 @@
 # app.py
 """
-StudyBuddy.ai — Ultra Premium (flan-t5-base local + optional HF Inference API)
+StudyBuddy.ai — Ultra Premium (flan-t5-base local + optional HF Router Inference API)
 Features:
 - Upload PDFs, extract text (pdfplumber)
 - Chunking + embeddings (sentence-transformers)
 - FAISS index for retrieval + reranking
 - Local generator (flan-t5-base) with deterministic beams + fallbacks
-- Optional remote generator using Hugging Face Inference API (fast, production-ready)
+- Optional remote generator using Hugging Face Router Inference API (fast, production-ready)
 - Robust MCQ generation (one-by-one + retries) with strict JSON output
 - Auto-retry for truncated Q&A answers
 - Ultra-premium UI + debug toggles
 
-To use Hugging Face inference: set env var HF_API_KEY=<your_key> or enter in the app and enable the UI toggle.
+To use Hugging Face Router API: set HF_API_KEY env var or paste token into app UI when enabling remote mode.
 """
 
 import os
@@ -35,7 +35,7 @@ import requests
 # ------------------------
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GEN_MODEL_NAME_LOCAL = "google/flan-t5-base"   # local model
-GEN_MODEL_NAME_HF = "google/flan-t5-base"      # remote model name on HF
+GEN_MODEL_NAME_HF = "google/flan-t5-base"      # remote model name on HF Router
 INDEX_DIM = 384
 TOP_K_DEFAULT = 6
 CHUNK_SIZE = 2000
@@ -157,7 +157,7 @@ def retrieve_chunks(query: str, embedder: SentenceTransformer, index, docs: List
     return results
 
 # ------------------------
-# GENERATION: local & HF remote
+# GENERATION: local & HF Router
 # ------------------------
 def run_generator_local(prompt: str, tokenizer, model, device,
                         max_tokens: int = 256, num_beams: int = 4, do_sample: bool = False,
@@ -210,16 +210,22 @@ def run_generator_local(prompt: str, tokenizer, model, device,
 def run_generator_hf(prompt: str, hf_api_key: str, model_name: str = GEN_MODEL_NAME_HF, max_tokens: int = 256,
                      parameters: dict = None) -> str:
     """
-    Use Hugging Face Inference API (text-generation endpoint) for the model.
+    Use Hugging Face Router Inference API.
     Requires HF_API_KEY.
     """
     if not hf_api_key:
         return ""
-    url = f"https://api-inference.huggingface.co/models/{model_name}"
-    headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "application/json"}
+
+    # New Router endpoint (required)
+    url = f"https://router.huggingface.co/hf-inference/models/{model_name}"
+
+    headers = {
+        "Authorization": f"Bearer {hf_api_key}",
+        "Content-Type": "application/json"
+    }
+
     payload = {
         "inputs": prompt,
-        "options": {"use_cache": False, "wait_for_model": True},
         "parameters": parameters or {
             "max_new_tokens": max_tokens,
             "temperature": 0.0,
@@ -228,33 +234,31 @@ def run_generator_hf(prompt: str, hf_api_key: str, model_name: str = GEN_MODEL_N
             "num_beams": 4
         }
     }
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        if resp.status_code == 200:
-            data = resp.json()
-            # HF returns a list of dicts with 'generated_text'
-            if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
-                return data[0]["generated_text"].strip()
-            # some HF endpoints return {'generated_text': ...}
-            if isinstance(data, dict) and "generated_text" in data:
-                return data["generated_text"].strip()
-            # fallback: stringify
-            return str(data)
-        else:
-            # return error text for debug
-            return f"[HF ERROR {resp.status_code}] {resp.text}"
+        data = resp.json()
+
+        # HF Router may return various shapes; handle common cases
+        if isinstance(data, dict) and "generated_text" in data:
+            return data["generated_text"].strip()
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) and "generated_text" in data[0]:
+            return data[0]["generated_text"].strip()
+
+        # return structured error if unexpected
+        return f"[HF ERROR {resp.status_code}] {data}"
+
     except Exception as e:
         return f"[HF EXCEPTION] {str(e)}"
 
 def run_generator(prompt: str, mode: str, tokenizer=None, model=None, device=None, hf_api_key: str = None,
                   max_tokens: int = 256, num_beams: int = 4, do_sample: bool = False, temperature: float = 0.0, retries: int = 1):
     """
-    Wrapper: choose remote HF inference or local generation.
+    Wrapper: choose remote HF Router inference or local generation.
     mode: 'hf' or 'local'
     """
     if mode == "hf":
-        return run_generator_hf(prompt, hf_api_key=hf_api_key, model_name=GEN_MODEL_NAME_HF, max_tokens=max_tokens,
-                                parameters={"max_new_tokens": max_tokens, "temperature": temperature, "num_beams": num_beams, "do_sample": do_sample})
+        return run_generator_hf(prompt, hf_api_key=hf_api_key, model_name=GEN_MODEL_NAME_HF, max_tokens=max_tokens, parameters={"max_new_tokens": max_tokens, "temperature": temperature, "num_beams": num_beams, "do_sample": do_sample})
     else:
         return run_generator_local(prompt, tokenizer, model, device, max_tokens=max_tokens, num_beams=num_beams, do_sample=do_sample, temperature=temperature, retries=retries)
 
@@ -492,7 +496,6 @@ def main():
             st.session_state.gen_model = mod
             st.session_state.device = dev
         except Exception:
-            # will load on demand
             st.session_state.tokenizer = None
             st.session_state.gen_model = None
             st.session_state.device = None
@@ -504,7 +507,7 @@ def main():
     # HF config – small UI control
     hf_col, _ = st.columns([3, 1])
     with hf_col:
-        use_hf = st.checkbox("Use remote inference (Hugging Face) — recommended for production speed & quality", value=False)
+        use_hf = st.checkbox("Use remote inference (Hugging Face Router) — recommended for production speed & quality", value=False)
         st.session_state.use_hf = use_hf
         if use_hf:
             key_input = st.text_input("Hugging Face API Key (or set HF_API_KEY env var)", value=st.session_state.hf_key, type="password")
