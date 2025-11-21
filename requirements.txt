@@ -9,4 +9,5 @@ numpy
 pandas
 tqdm
 scikit-learn
+requests
 

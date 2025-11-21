@@ -1,17 +1,23 @@
 # app.py
 """
-StudyBuddy.ai – Ultra Premium Streamlit App (flan-t5-base)
-- Upload PDFs, extract text
-- Chunking + semantic retrieval via SentenceTransformers + FAISS
-- Robust Q&A with RAG (flan-t5-base)
-- Reliable MCQ generation (few-shot JSON + beam decoding)
-- Local progress tracking
-- Ultra-premium dark UI (cards, KPIs, badges, debug modes)
+StudyBuddy.ai — Ultra Premium (flan-t5-base local + optional HF Inference API)
+Features:
+- Upload PDFs, extract text (pdfplumber)
+- Chunking + embeddings (sentence-transformers)
+- FAISS index for retrieval + reranking
+- Local generator (flan-t5-base) with deterministic beams + fallbacks
+- Optional remote generator using Hugging Face Inference API (fast, production-ready)
+- Robust MCQ generation (one-by-one + retries) with strict JSON output
+- Auto-retry for truncated Q&A answers
+- Ultra-premium UI + debug toggles
+
+To use Hugging Face inference: set env var HF_API_KEY=<your_key> or enter in the app and enable the UI toggle.
 """
 
 import os
 import json
 import re
+import time
 from typing import List, Dict, Any, Tuple
 
 import streamlit as st
@@ -22,12 +28,14 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import requests
 
 # ------------------------
 # CONFIG
 # ------------------------
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"         # swapped to base for better quality
+GEN_MODEL_NAME_LOCAL = "google/flan-t5-base"   # local model
+GEN_MODEL_NAME_HF = "google/flan-t5-base"      # remote model name on HF
 INDEX_DIM = 384
 TOP_K_DEFAULT = 6
 CHUNK_SIZE = 2000
@@ -42,12 +50,11 @@ os.makedirs("data", exist_ok=True)
 def load_embedder():
     return SentenceTransformer(EMBED_MODEL_NAME)
 
-@st.cache_resource(show_spinner="🤖 Loading generator model (flan-t5-base)...")
-def load_generator():
-    # auto-detect device
+@st.cache_resource(show_spinner="🤖 Loading local generator model (flan-t5-base)...")
+def load_generator_local():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME_LOCAL, use_fast=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME_LOCAL)
     model.to(device)
     return tokenizer, model, device
 
@@ -87,41 +94,82 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return [c for c in chunks if len(c) > 50]
 
 def build_faiss_index(embedder: SentenceTransformer, docs: List[Dict[str, Any]]):
+    """
+    Build FAISS index and return (index, embeddings)
+    Also stores embeddings in session state for reranking.
+    """
     texts = [d["text"] for d in docs]
-    emb = embedder.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-    faiss.normalize_L2(emb)
-    index = faiss.IndexFlatIP(emb.shape[1])
-    index.add(emb)
-    return index, emb
+    embeddings = embedder.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    return index, embeddings
 
-def retrieve_chunks(query: str, embedder: SentenceTransformer, index, docs: List[Dict[str, Any]], top_k: int = TOP_K_DEFAULT):
+def retrieve_chunks(query: str, embedder: SentenceTransformer, index, docs: List[Dict[str, Any]],
+                    top_k: int = TOP_K_DEFAULT, re_rank_top: int = 24) -> List[Dict[str, Any]]:
+    """
+    1) Use FAISS to get top `re_rank_top` candidates
+    2) Re-rank them by exact cosine with stored embeddings for stability
+    3) Return top_k final results
+    """
+    if index is None:
+        return []
+
     q_emb = embedder.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(q_emb)
-    scores, idxs = index.search(q_emb, top_k)
+    rr = max(top_k, re_rank_top)
+    scores, idxs = index.search(q_emb, rr)
     idxs = idxs[0]
-    scores = scores[0]
-    results = []
-    for i, score in zip(idxs, scores):
+    # Build candidate list
+    cand = []
+    for i in idxs:
         if i < 0 or i >= len(docs):
             continue
-        r = docs[i].copy()
-        r["score"] = float(score)
-        results.append(r)
-    # dedupe by (doc_id, chunk_id)
-    seen = {}
-    for r in results:
-        key = (r["doc_id"], r["chunk_id"])
-        if key not in seen or r["score"] > seen[key]["score"]:
-            seen[key] = r
-    results = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+        cand.append(i)
+
+    # Re-rank using stored embeddings if available
+    emb_matrix = st.session_state.get("embeddings", None)
+    ranked = []
+    if emb_matrix is not None:
+        cand_embs = emb_matrix[cand]  # shape (n, dim)
+        dot = np.dot(q_emb, cand_embs.T)[0]  # similarity scores
+        ranked = sorted(zip(cand, dot.tolist()), key=lambda x: x[1], reverse=True)
+    else:
+        # fallback: compute individually
+        temp = []
+        for i in cand:
+            emb = embedder.encode([docs[i]["text"]], convert_to_numpy=True)
+            faiss.normalize_L2(emb)
+            score = float(np.dot(q_emb, emb.T))
+            temp.append((i, score))
+        ranked = sorted(temp, key=lambda x: x[1], reverse=True)
+
+    results = []
+    added = set()
+    for i, score in ranked[:top_k]:
+        key = (docs[i]["doc_id"], docs[i]["chunk_id"])
+        if key in added:
+            continue
+        added.add(key)
+        item = docs[i].copy()
+        item["score"] = float(score)
+        results.append(item)
     return results
 
 # ------------------------
-# GENERATOR: deterministic beams, safe decoding
+# GENERATION: local & HF remote
 # ------------------------
-def run_generator(prompt: str, tokenizer, model, device, max_tokens: int = 256,
-                  num_beams: int = 4, do_sample: bool = False, temperature: float = 0.0):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+def run_generator_local(prompt: str, tokenizer, model, device,
+                        max_tokens: int = 256, num_beams: int = 4, do_sample: bool = False,
+                        temperature: float = 0.0, retries: int = 1) -> str:
+    """
+    Local generation with beams + fallback sampling retry logic.
+    """
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    except Exception:
+        # Tokenizer errors -> return empty
+        return ""
     gen_kwargs = dict(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
@@ -132,100 +180,196 @@ def run_generator(prompt: str, tokenizer, model, device, max_tokens: int = 256,
         early_stopping=True,
         no_repeat_ngram_size=3,
     )
-    with torch.no_grad():
-        outputs = model.generate(**gen_kwargs)
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return text.strip()
+    try:
+        with torch.no_grad():
+            out = model.generate(**gen_kwargs)
+        text = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+    except Exception:
+        # fallback: sampling
+        try:
+            with torch.no_grad():
+                out = model.generate(**{**gen_kwargs, "do_sample": True, "top_p": 0.95, "temperature": 0.9})
+            text = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+        except Exception:
+            text = ""
+
+    # Sanity check: if too short, retry with sampling/longer tokens
+    if retries > 0:
+        words = text.split()
+        if len(words) < 6:
+            try:
+                with torch.no_grad():
+                    out = model.generate(**{**gen_kwargs, "do_sample": True, "top_p": 0.95, "temperature": 0.85, "max_new_tokens": max(512, max_tokens*2)})
+                text2 = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+                if len(text2.split()) > len(words):
+                    text = text2
+            except Exception:
+                pass
+    return text
+
+def run_generator_hf(prompt: str, hf_api_key: str, model_name: str = GEN_MODEL_NAME_HF, max_tokens: int = 256,
+                     parameters: dict = None) -> str:
+    """
+    Use Hugging Face Inference API (text-generation endpoint) for the model.
+    Requires HF_API_KEY.
+    """
+    if not hf_api_key:
+        return ""
+    url = f"https://api-inference.huggingface.co/models/{model_name}"
+    headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": prompt,
+        "options": {"use_cache": False, "wait_for_model": True},
+        "parameters": parameters or {
+            "max_new_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 0.95,
+            "do_sample": False,
+            "num_beams": 4
+        }
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        if resp.status_code == 200:
+            data = resp.json()
+            # HF returns a list of dicts with 'generated_text'
+            if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
+                return data[0]["generated_text"].strip()
+            # some HF endpoints return {'generated_text': ...}
+            if isinstance(data, dict) and "generated_text" in data:
+                return data["generated_text"].strip()
+            # fallback: stringify
+            return str(data)
+        else:
+            # return error text for debug
+            return f"[HF ERROR {resp.status_code}] {resp.text}"
+    except Exception as e:
+        return f"[HF EXCEPTION] {str(e)}"
+
+def run_generator(prompt: str, mode: str, tokenizer=None, model=None, device=None, hf_api_key: str = None,
+                  max_tokens: int = 256, num_beams: int = 4, do_sample: bool = False, temperature: float = 0.0, retries: int = 1):
+    """
+    Wrapper: choose remote HF inference or local generation.
+    mode: 'hf' or 'local'
+    """
+    if mode == "hf":
+        return run_generator_hf(prompt, hf_api_key=hf_api_key, model_name=GEN_MODEL_NAME_HF, max_tokens=max_tokens,
+                                parameters={"max_new_tokens": max_tokens, "temperature": temperature, "num_beams": num_beams, "do_sample": do_sample})
+    else:
+        return run_generator_local(prompt, tokenizer, model, device, max_tokens=max_tokens, num_beams=num_beams, do_sample=do_sample, temperature=temperature, retries=retries)
 
 # ------------------------
-# MCQ generation (few-shot + JSON)
+# MCQ generation (one-by-one + retries)
 # ------------------------
-def generate_mcqs_from_chunk(chunk: str, num_questions: int, tokenizer, model, device) -> List[Dict[str, Any]]:
-    example_json = """
-[
-  {
-    "question": "What is the primary purpose of hypothesis testing?",
-    "options": [
-      "To estimate the population mean",
-      "To test a claim about a population using sample data",
-      "To compute descriptive statistics",
-      "To visualize data distribution"
-    ],
-    "answer_index": 1,
-    "explanation": "Hypothesis testing evaluates evidence from a sample to decide whether to reject a claim about the population."
-  }
-]
+def generate_mcqs_from_chunk(chunk: str, num_questions: int, gen_mode: str, tokenizer=None, model=None, device=None, hf_api_key: str = None) -> List[Dict[str, Any]]:
+    """
+    Generate MCQs one-by-one and validate JSON. Adaptive: uses local or HF generator depending on gen_mode.
+    """
+    def gen_one_question(material: str, q_index: int) -> Dict[str, Any]:
+        single_example = """
+{
+  "question": "What is the main goal of hypothesis testing?",
+  "options": ["Estimate a mean", "Test a claim about a population", "Visualize data", "Create a survey"],
+  "answer_index": 1,
+  "explanation": "Hypothesis testing uses sample data to decide whether to reject a population-level claim."
+}
 """
-    system_prompt = (
-        "You are an expert tutor. Output VALID JSON ONLY. "
-        "From the STUDY MATERIAL generate EXACTLY %d multiple-choice questions. "
-        "Each item must be an object with: "
-        "\"question\" (string), \"options\" (array of 4 short strings), "
-        "\"answer_index\" (0-based index), \"explanation\" (brief). "
-        "Return a JSON array only, no commentary."
-    ) % num_questions
+        system_prompt = (
+            "You are an expert tutor. Produce ONE multiple-choice question in VALID JSON ONLY. "
+            "The JSON must be an object with keys: question, options (array of 4), answer_index (0-based), explanation."
+        )
+        material_short = material[:2200]
+        prompt = system_prompt + "\n\nEXAMPLE:\n" + single_example + "\n\nMATERIAL:\n" + material_short + f"\n\nNow produce question number {q_index+1} as a JSON object."
+
+        attempts = 0
+        while attempts < 3:
+            raw = run_generator(prompt, gen_mode, tokenizer=tokenizer, model=model, device=device, hf_api_key=hf_api_key,
+                                max_tokens=320, num_beams=6, do_sample=False, temperature=0.0, retries=1)
+            # extract first {...}
+            m = re.search(r"(\{.*?\})", raw, flags=re.S)
+            json_text = m.group(1) if m else raw
+            try:
+                obj = json.loads(json_text)
+            except Exception:
+                import ast
+                try:
+                    obj = ast.literal_eval(json_text)
+                except Exception:
+                    obj = None
+            if obj:
+                try:
+                    q = str(obj["question"]).strip()
+                    options = [str(x).strip() for x in obj["options"]][:4]
+                    if len(options) < 4:
+                        raise ValueError("not 4 options")
+                    ans = int(obj["answer_index"])
+                    if not (0 <= ans < 4):
+                        raise ValueError("answer index out of range")
+                    exp = str(obj.get("explanation", "")).strip()
+                    return {"question": q, "options": options, "answer_index": ans, "explanation": exp}
+                except Exception:
+                    obj = None
+            # fallback: try sampling run
+            attempts += 1
+            prompt = prompt + "\n\nIf your previous JSON was invalid, try again and ensure valid JSON."
+        return None
 
     material = chunk.strip()
-    if len(material) > 2400:
-        material = material[:2400]
-
-    prompt = (
-        system_prompt + "\n\n"
-        "EXAMPLE_OUTPUT:\n" + example_json + "\n\n"
-        "STUDY MATERIAL:\n" + material + "\n\n"
-        "Output the JSON array now."
-    )
-
-    raw = run_generator(prompt, tokenizer, model, device, max_tokens=512, num_beams=6, do_sample=False, temperature=0.0)
-
-    # attempt to extract JSON array
-    m = re.search(r"(\[.*\])", raw, flags=re.S)
-    json_text = m.group(1) if m else raw
-    try:
-        data = json.loads(json_text)
-    except Exception:
-        import ast
-        try:
-            data = ast.literal_eval(json_text)
-        except Exception:
-            return []  # fail gracefully
-
     mcqs = []
-    for item in data:
-        try:
-            q = str(item["question"]).strip()
-            options = [str(x).strip() for x in item["options"]][:4]
-            if len(options) < 4:
-                continue
-            ans_idx = int(item["answer_index"])
-            if not (0 <= ans_idx < 4):
-                continue
-            explanation = str(item.get("explanation", "")).strip()
-            mcqs.append({"question": q, "options": options, "answer_index": ans_idx, "explanation": explanation})
-        except Exception:
-            continue
+    for i in range(num_questions):
+        qobj = gen_one_question(material, i)
+        if qobj:
+            mcqs.append(qobj)
+        else:
+            break
     return mcqs
 
 # ------------------------
-# Q&A prompt & citation extraction
+# Q&A prompt + auto-extend retry
 # ------------------------
-def answer_from_context(question: str, retrieved_chunks: List[Dict[str, Any]], tokenizer, model, device, max_answer_tokens: int = 320) -> Tuple[str, List[Dict[str, Any]], str]:
+def answer_from_context(question: str, retrieved_chunks: List[Dict[str, Any]],
+                        gen_mode: str, tokenizer=None, model=None, device=None, hf_api_key: str = None,
+                        max_answer_tokens: int = 420) -> Tuple[str, List[Dict[str, Any]], str]:
+    """
+    Build prompt to require citations. If truncated/short, auto-retry with more tokens and sampling.
+    Returns (answer_text, citation_list, raw_output).
+    """
     context_parts = []
-    for r in retrieved_chunks[:8]:
-        ctx = f"[{r['doc_id']}::chunk_{r['chunk_id']}]\n{r['text'][:900]}"
+    for r in retrieved_chunks[:10]:
+        ctx = f"[{r['doc_id']}::chunk_{r['chunk_id']}]\n{r['text'][:1000]}"
         context_parts.append(ctx)
     context_text = "\n\n".join(context_parts)
 
     prompt = (
         "You are a precise, concise tutor. Answer the QUESTION USING ONLY the STUDY MATERIAL below. "
-        "If the material doesn't contain the answer, reply exactly: "
+        "If the material does not contain the answer, respond exactly: "
         "\"I don't know based on the provided material.\" "
-        "Write: (1) Short answer (1-3 sentences), (2) short rationale, (3) a 'CITATIONS:' line listing sources as [doc::chunk_id]. "
+        "Provide: (A) Short answer (1-3 sentences), (B) brief rationale, (C) a 'CITATIONS:' line listing sources as [doc::chunk_id]. "
         "Do NOT hallucinate."
         f"\n\nSTUDY MATERIAL:\n{context_text}\n\nQUESTION: {question}\n\nAnswer now."
     )
 
-    raw = run_generator(prompt, tokenizer, model, device, max_tokens=max_answer_tokens, num_beams=4, do_sample=False, temperature=0.0)
+    raw = run_generator(prompt, gen_mode, tokenizer=tokenizer, model=model, device=device, hf_api_key=hf_api_key,
+                        max_tokens=max_answer_tokens, num_beams=4, do_sample=False, temperature=0.0, retries=1)
+
+    def looks_truncated(s: str) -> bool:
+        s = s.strip()
+        if not s:
+            return True
+        if len(s.split()) < 20 and not re.search(r"[.?!]$", s):
+            return True
+        # detect mid-phrase endings (common)
+        trailing = s.split()[-6:] if len(s.split()) >= 6 else s.split()
+        trail_join = " ".join(trailing).lower()
+        if re.search(r"\b(each layer|can be thought of|such as|for example|i\.e\.|e\.g\.)\b", trail_join):
+            return True
+        return False
+
+    if looks_truncated(raw):
+        # retry with expanded request
+        raw_retry = run_generator(prompt + "\n\nIf the previous answer looks short or incomplete, please expand the answer in 2 short paragraphs and include the CITATIONS line again.", gen_mode, tokenizer=tokenizer, model=model, device=device, hf_api_key=hf_api_key, max_tokens=max(600, max_answer_tokens*2), num_beams=3, do_sample=True, temperature=0.7, retries=0)
+        if len(raw_retry.split()) > len(raw.split()):
+            raw = raw_retry
 
     # extract citations
     cit_pattern = re.compile(r"\[([^\]]+::chunk_[0-9]+)\]")
@@ -244,7 +388,6 @@ def answer_from_context(question: str, retrieved_chunks: List[Dict[str, Any]], t
     answer_text = raw.strip()
     if len(answer_text) > 4000:
         answer_text = answer_text[:4000] + "..."
-
     return answer_text, cit_list, raw
 
 # ------------------------
@@ -277,7 +420,7 @@ def compute_mastery_score(stats: Dict[str, int]) -> float:
     return (stats["correct"] + 1) / (stats["total"] + 2)
 
 # ------------------------
-# Premium CSS
+# Ultra-premium CSS + UI helpers
 # ------------------------
 def set_ultra_premium_theme():
     st.set_page_config(page_title="StudyBuddy.ai — Ultra Premium", page_icon="📘", layout="wide")
@@ -288,13 +431,8 @@ def set_ultra_premium_theme():
     }
     body { background: linear-gradient(180deg,#020416 0%, #071020 70%); color: #e8f2fb; }
     .block-container{ max-width:1200px; margin:0 auto; padding:1.6rem 2rem;}
-    .brand {
-        display:flex; align-items:center; gap:12px; margin-bottom:8px;
-    }
-    .brand .logo {
-        width:48px; height:48px; border-radius:12px; background:linear-gradient(135deg,#0ea5a7,#5eead4);
-        display:flex; align-items:center; justify-content:center; font-weight:700; color:#02111a; font-size:20px;
-    }
+    .brand { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+    .brand .logo { width:48px; height:48px; border-radius:12px; background:linear-gradient(135deg,#0ea5a7,#5eead4); display:flex; align-items:center; justify-content:center; font-weight:700; color:#02111a; font-size:20px; }
     .title { font-size:20px; font-weight:800; letter-spacing:-0.4px; }
     .subtitle { color:var(--muted); font-size:13px; margin-top:-4px; }
     .card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:14px; padding:16px; border:1px solid rgba(255,255,255,0.04); box-shadow:0 10px 30px rgba(0,0,0,0.6); }
@@ -310,14 +448,14 @@ def set_ultra_premium_theme():
     """
     st.markdown(css, unsafe_allow_html=True)
 
-# ------------------------
-# App: UI
-# ------------------------
 def sidebar_panel():
     st.sidebar.markdown("### 📚 StudyBuddy.ai — Ultra Premium")
     st.sidebar.markdown("Upload PDFs, create index, ask accurate Q&A, generate MCQs, and follow a personalized study plan.")
-    st.sidebar.caption("Tip: Use searchable PDFs (no photos). For best RAG results, upload chapter-wise PDFs.")
+    st.sidebar.caption("Tip: Use searchable PDFs (not photos). For best RAG results, upload chapter-wise PDFs.")
 
+# ------------------------
+# APP: main UI
+# ------------------------
 def main():
     set_ultra_premium_theme()
     sidebar_panel()
@@ -338,32 +476,57 @@ def main():
         st.session_state.docs = []
     if "index" not in st.session_state:
         st.session_state.index = None
+    if "embeddings" not in st.session_state:
+        st.session_state.embeddings = None
     if "embedder" not in st.session_state:
         st.session_state.embedder = load_embedder()
-    if "tokenizer" not in st.session_state:
-        tok, mod, dev = load_generator()
-        st.session_state.tokenizer = tok
-        st.session_state.gen_model = mod
-        st.session_state.device = dev
+    if "use_hf" not in st.session_state:
+        st.session_state.use_hf = False
+    if "hf_key" not in st.session_state:
+        st.session_state.hf_key = os.environ.get("HF_API_KEY", "")
+    # lazy load local generator only if needed
+    if "tokenizer" not in st.session_state and not st.session_state.use_hf:
+        try:
+            tok, mod, dev = load_generator_local()
+            st.session_state.tokenizer = tok
+            st.session_state.gen_model = mod
+            st.session_state.device = dev
+        except Exception:
+            # will load on demand
+            st.session_state.tokenizer = None
+            st.session_state.gen_model = None
+            st.session_state.device = None
     if "mcq_history" not in st.session_state:
         st.session_state.mcq_history = []
     if "raw_last" not in st.session_state:
         st.session_state.raw_last = ""
 
+    # HF config – small UI control
+    hf_col, _ = st.columns([3, 1])
+    with hf_col:
+        use_hf = st.checkbox("Use remote inference (Hugging Face) — recommended for production speed & quality", value=False)
+        st.session_state.use_hf = use_hf
+        if use_hf:
+            key_input = st.text_input("Hugging Face API Key (or set HF_API_KEY env var)", value=st.session_state.hf_key, type="password")
+            st.session_state.hf_key = key_input.strip()
+            if not st.session_state.hf_key:
+                st.warning("Remote inference enabled but no HF API key provided. Provide a key to use remote generation.")
+
     # KPI row
-    col1, col2, col3, col4 = st.columns([1.2, 1, 1, 1])
     progress = load_progress()
     total_chunks = len(st.session_state.docs)
     total_quizzes = sum([v["total"] for v in progress.values()]) if progress else 0
     mastery_scores = [compute_mastery_score(v) for v in progress.values()] if progress else []
     avg_mastery = round(float(np.mean(mastery_scores)) if mastery_scores else 0.0, 3)
-    with col1:
+
+    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
+    with c1:
         st.markdown(f"<div class='kpi card'><div class='muted'>Indexed chunks</div><div class='num'>{total_chunks}</div></div>", unsafe_allow_html=True)
-    with col2:
+    with c2:
         st.markdown(f"<div class='kpi card'><div class='muted'>MCQs generated</div><div class='num'>{len(st.session_state.mcq_history)}</div></div>", unsafe_allow_html=True)
-    with col3:
+    with c3:
         st.markdown(f"<div class='kpi card'><div class='muted'>Quiz attempts</div><div class='num'>{total_quizzes}</div></div>", unsafe_allow_html=True)
-    with col4:
+    with c4:
         st.markdown(f"<div class='kpi card'><div class='muted'>Avg mastery</div><div class='num'>{avg_mastery:.2f}</div></div>", unsafe_allow_html=True)
 
     # Tabs
@@ -375,7 +538,7 @@ def main():
         uploaded = st.file_uploader("Upload PDFs (multiple allowed)", type=["pdf"], accept_multiple_files=True)
         left, right = st.columns([3,1])
         with left:
-            st.markdown("<div class='card'><b>Pro Tips</b><ul class='muted'><li>Searchable PDFs give best results</li><li>Split large books into chapters for fast indexing</li><li>Use the debug toggle if results look off</li></ul></div>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><b>Pro Tips</b><ul class='muted'><li>Searchable PDFs give best results</li><li>Split large books into chapters for fast indexing</li><li>Use debug toggles if results look off</li></ul></div>", unsafe_allow_html=True)
         with right:
             if st.button("🚀 Build / Refresh Index", use_container_width=True):
                 if not uploaded:
@@ -396,14 +559,14 @@ def main():
                     else:
                         with st.spinner("Computing embeddings & building FAISS index..."):
                             try:
-                                index, _ = build_faiss_index(st.session_state.embedder, docs)
+                                index, embs = build_faiss_index(st.session_state.embedder, docs)
                                 st.session_state.docs = docs
                                 st.session_state.index = index
+                                st.session_state.embeddings = embs
                                 st.success(f"Index built — {len(docs)} chunks.")
                             except Exception as e:
                                 st.exception(e)
                                 st.error("Failed to build index.")
-
         if st.session_state.docs:
             st.markdown("Indexed documents (preview)")
             meta = pd.DataFrame(st.session_state.docs)[["doc_id", "chunk_id"]]
@@ -420,25 +583,33 @@ def main():
                 query = st.text_area("Type your question here (conceptual or problem)", height=140)
             with opt_col:
                 top_k = st.slider("Citations (top-k chunks)", 3, 12, TOP_K_DEFAULT)
-                debug = st.checkbox("Show raw output", key="qa_debug")
+                debug = st.checkbox("Show raw model output", key="qa_debug")
                 btn = st.button("🔍 Get Answer", use_container_width=True)
             if btn:
                 if not query.strip():
                     st.warning("Please enter a question.")
                 else:
-                    embedder = st.session_state.embedder
-                    index = st.session_state.index
-                    docs = st.session_state.docs
+                    # ensure local generator loaded if needed
+                    if not st.session_state.use_hf and (st.session_state.tokenizer is None or st.session_state.gen_model is None):
+                        try:
+                            tok, mod, dev = load_generator_local()
+                            st.session_state.tokenizer = tok
+                            st.session_state.gen_model = mod
+                            st.session_state.device = dev
+                        except Exception as e:
+                            st.error("Failed to load local generator. Try enabling remote HF inference or check logs.")
+                            st.exception(e)
+                    gen_mode = "hf" if st.session_state.use_hf else "local"
                     tokenizer = st.session_state.tokenizer
                     gen_model = st.session_state.gen_model
                     device = st.session_state.device
+                    hf_key = st.session_state.hf_key or os.environ.get("HF_API_KEY", "")
 
                     with st.spinner("Retrieving context & generating answer..."):
-                        retrieved = retrieve_chunks(query, embedder, index, docs, top_k=top_k)
-                        answer_text, citations, raw = answer_from_context(query, retrieved, tokenizer, gen_model, device, max_answer_tokens=420)
+                        retrieved = retrieve_chunks(query, st.session_state.embedder, st.session_state.index, st.session_state.docs, top_k=top_k)
+                        answer_text, citations, raw = answer_from_context(query, retrieved, gen_mode, tokenizer=tokenizer, model=gen_model, device=device, hf_api_key=hf_key, max_answer_tokens=420)
                         st.session_state.raw_last = raw
 
-                    # Nicely formatted answer card
                     st.markdown("<div class='card'><b>Answer</b></div>", unsafe_allow_html=True)
                     st.markdown(answer_text)
                     if citations:
@@ -447,7 +618,6 @@ def main():
                             st.markdown(f"<span class='citation-badge'>{c['doc_id']} • chunk {c['chunk_id']}</span>", unsafe_allow_html=True)
                     else:
                         st.markdown("<div class='muted'>No citations (model did not reference retrieved chunks).</div>", unsafe_allow_html=True)
-
                     if debug:
                         st.markdown("#### Raw model output")
                         st.code(st.session_state.raw_last)
@@ -471,12 +641,25 @@ def main():
                 debug_mcq = st.checkbox("Show raw MCQ output", key="mcq_debug")
 
             if st.button("🎯 Generate MCQs", use_container_width=True):
+                # ensure local generator loaded if needed
+                if not st.session_state.use_hf and (st.session_state.tokenizer is None or st.session_state.gen_model is None):
+                    try:
+                        tok, mod, dev = load_generator_local()
+                        st.session_state.tokenizer = tok
+                        st.session_state.gen_model = mod
+                        st.session_state.device = dev
+                    except Exception as e:
+                        st.error("Failed to load local generator. Try enabling remote HF inference or check logs.")
+                        st.exception(e)
+                gen_mode = "hf" if st.session_state.use_hf else "local"
                 tokenizer = st.session_state.tokenizer
                 gen_model = st.session_state.gen_model
                 device = st.session_state.device
+                hf_key = st.session_state.hf_key or os.environ.get("HF_API_KEY", "")
+
                 candidate_text = " ".join([c["text"] for c in doc_chunks[:3]])[:4000]
-                with st.spinner("Generating MCQs (this may take 20-60s depending on CPU/GPU)..."):
-                    mcqs = generate_mcqs_from_chunk(candidate_text, num_q, tokenizer, gen_model, device)
+                with st.spinner("Generating MCQs (may take 20-60s depending on mode)..."):
+                    mcqs = generate_mcqs_from_chunk(candidate_text, num_q, gen_mode, tokenizer=tokenizer, model=gen_model, device=device, hf_api_key=hf_key)
                     st.session_state.mcq_history = mcqs
                 if not mcqs:
                     st.error("MCQ generation failed or returned invalid format. Try again or reduce questions.")
@@ -538,7 +721,7 @@ def main():
                         st.markdown(f"- **{it['doc_id']} — chunk {it['chunk_id']}** (mastery: {it.get('mastery_score', 0):.2f})")
 
 # ------------------------
-# Study plan helper (same algorithm)
+# Study plan helper
 # ------------------------
 def generate_study_plan(progress: Dict[str, Any], docs: List[Dict[str, Any]], days: int = 7, max_per_day: int = 6) -> Dict[int, List[Dict[str, Any]]]:
     topic_map = {}
