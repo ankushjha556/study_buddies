@@ -3,9 +3,10 @@ sentence-transformers
 faiss-cpu
 transformers
 torch
-tqdm
-numpy
-pandas
 pdfplumber
 Pillow
+numpy
+pandas
+tqdm
 scikit-learn
+
